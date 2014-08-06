@@ -27,9 +27,11 @@ NAME=''
 PREFIX='/usr/local'
 PREFIXSET=''
 CHROOTSLINK='/mnt/stateful_partition/crouton/chroots'
+MOUNTPOINT='/var/crouton'
 PROXY='unspecified'
 RELEASE=''
 RESTORE=''
+RESTOREBIN=''
 DEFAULTRELEASE='precise'
 TARBALL=''
 TARGETS=''
@@ -40,6 +42,7 @@ UPDATEIGNOREEXISTING=''
 USAGE="$APPLICATION [options] -t targets
 $APPLICATION [options] -f backup_tarball
 $APPLICATION [options] -d -f bootstrap_tarball
+$APPLICATION -S [partition_options]
 
 Constructs a chroot for running a more standard userspace alongside Chromium OS.
 
@@ -50,6 +53,11 @@ If run with -d, a bootstrap tarball is created to speed up chroot creation in
 the future. You can use bootstrap tarballs generated this way by passing them
 to -f the next time you create a chroot with the same architecture and release.
 
+If run with -S, a separate partition is created for crouton, immune from
+accidental wiping when switching back and forth between developer/normal mode,
+as well as powerwashes.
+Run $APPLICATION -S -h for additional help.
+
 $APPLICATION must be run as root unless -d is specified AND fakeroot is
 installed AND /tmp is mounted exec and dev.
 
@@ -58,6 +66,10 @@ It is highly recommended to run this from a crosh shell (Ctrl+Alt+T), not VT2.
 Options:
     -a ARCH     The architecture to prepare a new chroot or bootstrap for.
                 Default: autodetected for the current chroot or system.
+    -b          Restore crouton scripts in PREFIX/bin, as required by the
+                chroots currently installed in PREFIX/chroots (or
+                $MOUNTPOINT/chroots if -p is not specified, and the crouton
+                partition exists).
     -d          Downloads the bootstrap tarball but does not prepare the chroot.
     -e          Encrypt the chroot with ecryptfs using a passphrase.
                 If specified twice, prompt to change the encryption passphrase.
@@ -78,7 +90,9 @@ Options:
     -p PREFIX   The root directory in which to install the bin and chroot
                 subdirectories and data.
                 Default: $PREFIX, with $PREFIX/chroots linked to
-                $CHROOTSLINK.
+                $CHROOTSLINK, unless the crouton partition
+                is detected, in which case the partition is mounted, and chroots
+                are installed in $MOUNTPOINT.
     -P PROXY    Set an HTTP proxy for the chroot; effectively sets http_proxy.
                 Specify an empty string to remove a proxy when updating.
     -r RELEASE  Name of the distribution release. Default: $DEFAULTRELEASE,
@@ -104,13 +118,22 @@ secure as the passphrases you assign to them."
 #               Targets specified with -t will be installed, but not recorded
 #               for future updates.
 
+# Pass parameters to mkpart.sh
+if [ "$1" = "-S" ]; then
+    shift
+    APPLICATION="$APPLICATION -S"
+    . "$SCRIPTDIR/installer/mkpart.sh"
+    exit 0
+fi
+
 # Common functions
 . "$SCRIPTDIR/installer/functions"
 
 # Process arguments
-while getopts 'a:def:k:m:M:n:p:P:r:s:t:T:uUV' f; do
+while getopts 'a:bdef:k:m:M:n:p:P:r:s:t:T:uUV' f; do
     case "$f" in
     a) ARCH="$OPTARG";;
+    b) RESTOREBIN='y';;
     d) DOWNLOADONLY='y';;
     e) ENCRYPT="${ENCRYPT:-"-"}e";;
     f) TARBALL="$OPTARG";;
@@ -164,23 +187,29 @@ if [ "$RELEASE" = 'list' -o "$RELEASE" = 'help' ]; then
     exit 2
 fi
 
-# Either a tarball, update, or target must be specified.
-if [ -z "$TARBALL$UPDATE$TARGETS$TARGETFILE" ]; then
+# Either a tarball, update, target, or restore binaries must be specified.
+if [ -z "$TARBALL$UPDATE$TARGETS$TARGETFILE$RESTOREBIN" ]; then
     error 2 "$USAGE"
 fi
 
-# Download only + update doesn't make sense
-if [ -n "$DOWNLOADONLY" -a -n "$UPDATE" ]; then
+# Only one of 'download only', update and restore binaries can be specified
+test="$DOWNLOADONLY${UPDATE:+y}$RESTOREBIN"
+if [ "${#test}" -gt 1 ]; then
     error 2 "$USAGE"
 fi
 
 # ARCH cannot be specified upon update
-if [ -n "$UPDATE" -a -n "$ARCH" ]; then
-    error 2 'Architecture cannot be specified when updating.'
+if [ -n "$UPDATE$RESTOREBIN" -a -n "$ARCH" ]; then
+    error 2 'Architecture cannot be specified with -b or -u.'
+fi
+
+# Release or name cannot be specified when restoring binaries
+if [ -n "$RESTOREBIN" -a -n "$NAME$RELEASE" ]; then
+    error 2 "Name or release cannot be specified with -b."
 fi
 
 # MIRROR and MIRROR2 must not be specified on update
-if [ "$UPDATE" = 1 ]; then
+if [ "$UPDATE" = 1 -o -n "$RESTOREBIN" ]; then
     if [ -z "$MIRROR$MIRROR2" ]; then
         # Makes sure MIRROR does not get overriden by distribution default
         MIRROR='unspecified'
@@ -253,7 +282,7 @@ elif [ -n "$DOWNLOADONLY" -a -s "$TARBALL" ]; then
 fi
 
 # If we're not restoring, updating, or bootstrapping, targets must be specified
-if [ -z "$RESTORE$UPDATE$DOWNLOADONLY$TARGETS$TARGETFILE" ]; then
+if [ -z "$RESTORE$RESTOREBIN$UPDATE$DOWNLOADONLY$TARGETS$TARGETFILE" ]; then
     error 2 "$USAGE"
 fi
 
@@ -353,23 +382,57 @@ fi
 # Make sure we always have echo when this script exits
 addtrap "stty echo 2>/dev/null"
 
-# Deterime directories, and fix NAME if it was not specified.
+# Determine directories
 BIN="$PREFIX/bin"
-CHROOTS="$PREFIX/chroots"
-CHROOT="$CHROOTS/${NAME:="${RELEASE:-"$DEFAULTRELEASE"}"}"
-CHROOTSRC="$CHROOT"
-TARGETDEDUPFILE="$CHROOT/.crouton-targets"
 
-# Validate chroot name
-if ! validate_name "$NAME"; then
-    error 2 "Invalid chroot name '$NAME'."
+# Try to mount the crouton partition, if it exists, and no prefix is set.
+if [ "$USER" = root -o "$UID" = 0 ] && \
+            [ -z "$PREFIXSET" ] && mountcrouton "$MOUNTPOINT"; then
+    # If the crouton partition exists, install binaries in /usr/local an
+    # chroots in the partition
+    CHROOTS="$MOUNTPOINT/chroots"
+else
+    CHROOTS="$PREFIX/chroots"
 fi
 
+if [ -z "$RESTOREBIN" ]; then
+    # Fix NAME if it was not specified.
+    CHROOT="$CHROOTS/${NAME:="${RELEASE:-"$DEFAULTRELEASE"}"}"
+    CHROOTSRC="$CHROOT"
+    TARGETDEDUPFILE="$CHROOT/.crouton-targets"
+else
+    TARGETDEDUPFILE="`mktemp --tmpdir=/tmp "$APPLICATION-dedup.XXX"`"
+    addtrap "rm -f '$TARGETDEDUPFILE'"
+fi
+
+# Mount the chroot specified by $1, and return its path
+mountchroot() {
+    local ret=0
+
+    # Mount the chroot. mount-chroot output the chroot path
+    if [ -n "$KEYFILE" ]; then
+        sh -e "$HOSTBINDIR/mount-chroot" -k "$KEYFILE" \
+                          $create $ENCRYPT -p -c "$CHROOTS" -- "$1" || ret=$?
+    else
+        sh -e "$HOSTBINDIR/mount-chroot" \
+                          $create $ENCRYPT -p -c "$CHROOTS" -- "$1" || ret=$?
+    fi
+
+    return $ret
+}
+
 # Confirm we have write access to the directory before starting.
-if [ -z "$DOWNLOADONLY" ]; then
-    # If no prefix is set, check that /usr/local/chroots ($CHROOTS) is a
-    # symbolic link to /mnt/stateful_partition/crouton/chroots ($CHROOTSLINK)
-    if [ -z "$PREFIXSET" -a ! -h "$CHROOTS" ]; then
+if [ -z "$RESTOREBIN" -a -z "$DOWNLOADONLY" ]; then
+    # Validate chroot name
+    if ! validate_name "$NAME"; then
+        error 2 "Invalid chroot name '$NAME'."
+    fi
+
+    # If no prefix is set and the crouton partition is not being used, check
+    # that /usr/local/chroots ($CHROOTS) is a symbolic link to
+    # /mnt/stateful_partition/crouton/chroots ($CHROOTSLINK).
+    if [ -z "$PREFIXSET" -a "$CHROOTS" != "$MOUNTPOINT/chroots" \
+                         -a ! -h "$CHROOTS" ]; then
         # Detect if chroots are left in the old chroots directory, and move them
         # to the new directory.
         if [ -e "$CHROOTS" ] && ! rmdir "$CHROOTS" 2>/dev/null; then
@@ -436,14 +499,7 @@ Either delete it, specify a different name (-n), or specify -u to update it."
     fi
 
     # Mount the chroot and update CHROOT path
-    if [ -n "$KEYFILE" ]; then
-        CHROOT="`sh "$HOSTBINDIR/mount-chroot" -k "$KEYFILE" \
-                            $create $ENCRYPT -p -c "$CHROOTS" -- "$NAME"`"
-    else
-        CHROOT="`sh "$HOSTBINDIR/mount-chroot" \
-                            $create $ENCRYPT -p -c "$CHROOTS" -- "$NAME"`"
-    fi
-
+    CHROOT="`mountchroot "$NAME"`"
     # Auto-unmount the chroot when the script exits
     addtrap "sh '$HOSTBINDIR/unmount-chroot' -y -c '$CHROOTS' -- '$NAME' 2>/dev/null"
 
@@ -552,19 +608,21 @@ elif [ -z "$DOWNLOADONLY" ] && \
 fi
 
 # Unpack the tarball if appropriate
-if [ -z "$RESTORE" -a -z "$UPDATE" -a -z "$DOWNLOADONLY" ]; then
+if [ -z "$RESTOREBIN" -a -z "$RESTORE" -a \
+            -z "$UPDATE" -a -z "$DOWNLOADONLY" ]; then
     echo "Installing $RELEASE-$ARCH chroot to $CHROOTSRC" 1>&2
     if [ -n "$TARBALL" ]; then
         # Unpack the chroot
         echo 'Unpacking chroot environment...' 1>&2
         tar -C "$CHROOT" --strip-components=1 -xf "$TARBALL"
     fi
-elif [ -z "$RESTORE" -a -z "$UPDATE" ]; then
+elif [ -z "$RESTOREBIN" -a -z "$RESTORE" -a -z "$UPDATE" ]; then
     echo "Downloading $RELEASE-$ARCH bootstrap to $TARBALL" 1>&2
 fi
 
 # Download the bootstrap data if appropriate
-if [ -z "$UPDATE" ] && [ -n "$DOWNLOADONLY" -o -z "$TARBALL" ]; then
+if [ -z "$UPDATE" -a -z "$RESTOREBIN" ] && \
+        [ -n "$DOWNLOADONLY" -o -z "$TARBALL" ]; then
     # Create the temporary directory and delete it upon exit
     tmp="`mktemp -d --tmpdir=/tmp "$APPLICATION.XXX"`"
     subdir="$RELEASE-$ARCH"
@@ -596,15 +654,10 @@ if [ -z "$UPDATE" ] && [ -n "$DOWNLOADONLY" -o -z "$TARBALL" ]; then
     undotrap
 fi
 
-# Ensure that /usr/local/bin and /etc/crouton exist
-mkdir -p "$CHROOT/usr/local/bin" "$CHROOT/etc/crouton"
-
-# If -U was not specified, update existing targets.
-if [ -z "$UPDATEIGNOREEXISTING" ]; then
-    # Read the explicit targets file in the chroot (if it exists)
-    TARGETSFILE="$CHROOT/etc/crouton/targets"
-    if [ -r "$TARGETSFILE" ]; then
-        read t < "$TARGETSFILE"
+# Add the list of targets in file $1 to $TARGETS
+deduptargets() {
+    if [ -r "$1" ]; then
+        read t < "$1"
         t="${t%,},"
         while [ -n "$t" ]; do
             TARGET="${t%%,*}"
@@ -625,56 +678,92 @@ if [ -z "$UPDATEIGNOREEXISTING" ]; then
             TARGETS="${TARGETS%,},$TARGET"
         done
     fi
+}
 
-    if [ -z "$TARGETS" ]; then
-        error 1 "\
-No target list found (your chroot may be very old).
-Please specify targets with -t."
-    fi
+if [ -z "$RESTOREBIN" ] && [ -z "$RESTORE" -o -n "$UPDATE" ]; then
+    PREPARE="$CHROOT/prepare.sh"
 
-    # Reset the installed target list files
-    echo "$TARGETS" > "$TARGETSFILE"
-fi
-
-# Create the setup script inside the chroot
-echo 'Preparing chroot environment...' 1>&2
-VAREXPAND="s/releases=.*\$/releases=\"\
+    # Create the setup script inside the chroot
+    echo 'Preparing chroot environment...' 1>&2
+    VAREXPAND="s/releases=.*\$/releases=\"\
 `sed 's/$/\\\\/' "$DISTRODIR/releases"`
 \"/;"
-VAREXPAND="${VAREXPAND}s #ARCH# $ARCH ;s #DISTRO# $DISTRO ;"
-VAREXPAND="${VAREXPAND}s #MIRROR# $MIRROR ;s #MIRROR2# $MIRROR2 ;"
-VAREXPAND="${VAREXPAND}s #RELEASE# $RELEASE ;s #PROXY# $PROXY ;"
-VAREXPAND="${VAREXPAND}s #VERSION# ${VERSION:-"git"} ;"
-VAREXPAND="${VAREXPAND}s #USERNAME# $CROUTON_USERNAME ;"
-VAREXPAND="${VAREXPAND}s/#SETOPTIONS#/$SETOPTIONS/;"
-installscript "$INSTALLERDIR/prepare.sh" "$CHROOT/prepare.sh" "$VAREXPAND"
-# Append the distro-specific prepare.sh
-cat "$DISTRODIR/prepare" >> "$CHROOT/prepare.sh"
+    VAREXPAND="${VAREXPAND}s #ARCH# $ARCH ;s #DISTRO# $DISTRO ;"
+    VAREXPAND="${VAREXPAND}s #MIRROR# $MIRROR ;s #MIRROR2# $MIRROR2 ;"
+    VAREXPAND="${VAREXPAND}s #RELEASE# $RELEASE ;s #PROXY# $PROXY ;"
+    VAREXPAND="${VAREXPAND}s #VERSION# ${VERSION:-"git"} ;"
+    VAREXPAND="${VAREXPAND}s #USERNAME# $CROUTON_USERNAME ;"
+    VAREXPAND="${VAREXPAND}s/#SETOPTIONS#/$SETOPTIONS/;"
+    installscript "$INSTALLERDIR/prepare.sh" "$PREPARE" "$VAREXPAND"
+    # Append the distro-specific prepare.sh
+    cat "$DISTRODIR/prepare" >> "$PREPARE"
+else # Restore host-bin only
+    PREPARE="/dev/null"
+
+    # Make sure targets are aware that we only want to restore host-bin
+    RESTOREHOSTBIN='y'
+fi
+
+if [ -z "$RESTOREBIN" ]; then
+    # Ensure that /usr/local/bin and /etc/crouton exist
+    mkdir -p "$CHROOT/usr/local/bin" "$CHROOT/etc/crouton"
+
+    # If -U was not specified, update existing targets.
+    if [ -z "$UPDATEIGNOREEXISTING" ]; then
+	TARGETSFILE="$CHROOT/etc/crouton/targets"
+
+	# Read the explicit targets file in the chroot
+	deduptargets "$TARGETSFILE"
+
+        if [ -z "$TARGETS" ]; then
+            error 1 "\
+No target list found (your chroot may be very old).
+Please specify targets with -t."
+        fi
+
+	# Reset the installed target list files
+	echo "$TARGETS" > "$TARGETSFILE"
+    fi
+else
+    for file in "$CHROOTS"/*; do
+        if [ ! -d "$file" ]; then
+            continue
+        fi
+
+        name="${file#$CHROOTS/}"
+        if ! chroot="`mountchroot "$name"`"; then
+            echo "Unable to mount chroot $name: ignoring." 2>&1
+        else
+            # Auto-unmount the chroot when the script exits
+            addtrap "sh -e '$HOSTBINDIR/unmount-chroot' \
+                        -y -c '$CHROOTS' -- '$name' 2>/dev/null"
+
+            deduptargets "$chroot/etc/crouton/targets"
+        fi
+    done
+fi
 
 echo -n '' > "$TARGETDEDUPFILE"
 # Run each target, appending stdout to the prepare script.
 unset SIMULATE
 if [ -n "$TARGETFILE" ]; then
     TARGET="`readlink -f "$TARGETFILE"`"
-    (. "$TARGET") >> "$CHROOT/prepare.sh"
+    (. "$TARGET") >> "$PREPARE"
 fi
 t="${TARGETS%,},post-common,"
 while [ -n "$t" ]; do
     TARGET="${t%%,*}"
     t="${t#*,}"
     if [ -n "$TARGET" ]; then
-        (. "$TARGETSDIR/$TARGET") >> "$CHROOT/prepare.sh"
+        (. "$TARGETSDIR/$TARGET") >> "$PREPARE"
     fi
 done
 
-if [ -z "$RESTORE" -o -n "$UPDATE" ]; then
-    chmod 500 "$CHROOT/prepare.sh"
+if [ "$PREPARE" != "/dev/null" ]; then
+    chmod 500 "$PREPARE"
 
     # Run the setup script inside the chroot
     sh -e "$HOSTBINDIR/enter-chroot" -c "$CHROOTS" -n "$NAME" -xx
-else
-    # We don't actually need to run the prepare.sh when only restoring
-    rm -f "$CHROOT/prepare.sh"
 fi
 
 echo "Done! You can enter the chroot using enter-chroot." 1>&2
