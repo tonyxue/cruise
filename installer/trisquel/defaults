@@ -1,0 +1,28 @@
+#!/bin/sh -e
+# Copyright (c) 2014 The crouton Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This file is sourced from main.sh to update distro-specific defaults.
+# It must set at least ARCH and MIRROR if not already specified.
+
+if [ -z "$ARCH" ]; then
+    ARCH="`uname -m`"
+fi
+
+case "$ARCH" in
+x86 | i?86) ARCH="i386";;
+x86_64 | amd64) ARCH="amd64";;
+arm*) echo "Sorry arch not supported.";;
+*) error 2 "Invalid architecture '$ARCH'.";;
+esac
+
+if [ -z "$MIRROR" ]; then
+    MIRROR="${CROUTON_MIRROR_ubuntu_x86:-http://http://archive.trisquel.info/trisquel/}"
+fi
+
+if [ $RELEASE = "toutatis" ];then
+        UPSTREAM_RELEASE="precise"
+elif [ $RELEASE = "belenos" ];then
+        UPSTREAM_RELEASE="trusty"
+fi

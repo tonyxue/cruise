@@ -75,6 +75,16 @@ deb-src $MIRROR $RELEASE-updates main restricted universe multiverse
 deb $MIRROR $RELEASE-security main restricted universe multiverse
 deb-src $MIRROR $RELEASE-security main restricted universe multiverse
 EOF
+        elif [ "$DISTRO" = 'trisquel' ]; then
+                # Trisquel has its own set
+                cat /etc/apt/sources.list <<EOF
+deb $MIRROR $RELEASE main
+deb $MIRROR $RELEASE-security main
+deb $MIRROR $RELEASE-updates main
+deb-src $MIRROR $RELEASE main
+deb-src $MIRROR $RELEASE-security main
+deb-src $MIRROR $RELEASE-updates main
+EOF
         else
             # Not all Debian distros have all sets of repos
             cat > /etc/apt/sources.list <<EOF
