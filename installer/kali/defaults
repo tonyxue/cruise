@@ -25,6 +25,3 @@ if [ -z "$MIRROR2" ]; then
     MIRROR2="${CROUTON_MIRROR2_kali:-http://security.kali.org/kali-security}"
 fi
 
-BOOTSTRAP_RELEASE="stable"
-
-
